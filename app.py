@@ -54,7 +54,7 @@ VEREDICTO_DEFICIENTE = (
 
 # ── Licencia (compatible con Zajuna Panel) ───────────────────────────────────
 
-ZP_SECRET = "ftM_k2tzaEmrf7hBFE_xTarWJJDfSELX"
+ZP_SECRET = "iEVRy8fnOjrBzm_tTySZ_6UK8xBkw1R1"
 ZP_EPOCH = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
