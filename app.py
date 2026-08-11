@@ -7,12 +7,15 @@ import base64
 import hashlib
 import hmac
 import io
+import math
 import os
 import tempfile
+import time
 import zipfile
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+import extra_streamlit_components as stx
 import pandas as pd
 import streamlit as st
 from openai import OpenAI
@@ -82,6 +85,32 @@ def zp_validate(code: str) -> dict:
     return {"valid": True, "expires": expires_dt, "days_left": days_left}
 
 
+# ── Prueba gratuita de 14 días (compatible con Zajuna Panel) ───────────────────
+# RetroTutor cloud es una sola app compartida (no tiene storage local por
+# instalación como la extensión), así que el inicio de la prueba se guarda en
+# una cookie del navegador (400 días, la misma persona la conserva de sesión en
+# sesión) — mismo espíritu que la extensión: validación offline, sin backend.
+
+ZP_TRIAL_DAYS = 14
+
+
+def zp_trial_status(cookie_manager: stx.CookieManager) -> dict:
+    cookies = cookie_manager.get_all()
+    raw = cookies.get("zpTrialStart")
+    if raw is None:
+        start_ms = int(time.time() * 1000)
+        cookie_manager.set("zpTrialStart", start_ms, max_age=400 * 86400)
+    else:
+        try:
+            start_ms = int(raw)
+        except (TypeError, ValueError):
+            start_ms = int(time.time() * 1000)
+    start = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
+    ends_at = start + timedelta(days=ZP_TRIAL_DAYS)
+    days_left = max(0, math.ceil((ends_at - datetime.now(timezone.utc)).total_seconds() / 86400))
+    return {"active": days_left > 0, "days_left": days_left, "ends_at": ends_at}
+
+
 # ── Estado ────────────────────────────────────────────────────────────────────
 
 if "espacios" not in st.session_state:
@@ -90,6 +119,19 @@ if "espacio_idx" not in st.session_state:
     st.session_state.espacio_idx = None
 if "licencia_ok" not in st.session_state:
     st.session_state.licencia_ok = False
+if "licencia_trial" not in st.session_state:
+    st.session_state.licencia_trial = False
+
+_cookie_manager = stx.CookieManager()
+
+if not st.session_state.licencia_ok:
+    _trial = zp_trial_status(_cookie_manager)
+    if _trial["active"]:
+        st.session_state.licencia_ok = True
+        st.session_state.licencia_trial = True
+        st.session_state.licencia_days = _trial["days_left"]
+    else:
+        st.session_state.licencia_trial_expired = True
 
 
 # ── Funciones ─────────────────────────────────────────────────────────────────
@@ -236,6 +278,8 @@ def mostrar_gate():
         "Retroalimentación automática con IA para evidencias estudiantiles. "
         "Disponible para suscriptores de **Zajuna Panel Pro**."
     )
+    if st.session_state.get("licencia_trial_expired"):
+        st.info("Tu prueba gratuita de 14 días terminó. Activa tu código Pro para seguir usando RetroTutor.")
     st.divider()
 
     col1, col2 = st.columns([2, 1])
@@ -286,7 +330,25 @@ with st.sidebar:
     st.header("⚙️ Configuración")
 
     days_left = st.session_state.get("licencia_days", 0)
-    if days_left <= 7:
+    if st.session_state.get("licencia_trial"):
+        if days_left <= 3:
+            st.warning(f"🎟️ Prueba gratuita: te quedan {days_left} día(s).")
+        else:
+            st.info(f"🎟️ Prueba gratuita: te quedan {days_left} día(s) de acceso completo.")
+        with st.expander("¿Ya tienes tu código Pro?"):
+            trial_code = st.text_input(
+                "Código de licencia", placeholder="ZP-XXX-XXXX-XXXXXX", key="trial_upgrade_code",
+            )
+            if st.button("Activar", key="trial_upgrade_btn", disabled=not trial_code):
+                result = zp_validate(trial_code)
+                if result["valid"]:
+                    st.session_state.licencia_trial = False
+                    st.session_state.licencia_code = trial_code
+                    st.session_state.licencia_days = result["days_left"]
+                    st.rerun()
+                else:
+                    st.error(result["reason"])
+    elif days_left <= 7:
         st.warning(f"Tu licencia vence en {days_left} día(s).")
     else:
         st.success(f"Licencia activa ({days_left} días restantes)")
