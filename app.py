@@ -3,7 +3,6 @@ RetroTutor Cloud — Retroalimentación automática de evidencias estudiantiles.
 Versión desplegable en Streamlit Cloud. Soporta documentos, texto e imágenes.
 """
 
-import base64
 import hashlib
 import hmac
 import io
@@ -109,6 +108,7 @@ def zp_trial_status(cookie_manager: stx.CookieManager) -> dict:
     ends_at = start + timedelta(days=ZP_TRIAL_DAYS)
     days_left = max(0, math.ceil((ends_at - datetime.now(timezone.utc)).total_seconds() / 86400))
     return {"active": days_left > 0, "days_left": days_left, "ends_at": ends_at}
+
 
 
 # ── Estado ────────────────────────────────────────────────────────────────────
@@ -738,3 +738,4 @@ else:
 
         if not api_key and pendientes:
             st.warning("Ingresa tu API Key en la barra lateral para generar retroalimentaciones.")
+
