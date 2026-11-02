@@ -165,3 +165,61 @@ def test_excel():
 def test_nombre_seguro():
     assert core.nombre_seguro("Ensayo: final/2") == "Ensayo_final2"
     assert core.nombre_seguro("***") == "entrega"
+
+
+class FakeAnthropic:
+    """Cliente simulado con la forma de respuesta de messages.create."""
+
+    def __init__(self, bloques, stop_reason="end_turn", error=None):
+        self.bloques, self.stop_reason, self.error = bloques, stop_reason, error
+        self.messages = self
+
+    def create(self, **kwargs):
+        self.kwargs = kwargs
+        if self.error:
+            raise self.error
+        bloques = [type("B", (), b) for b in self.bloques]
+        return type("R", (), {"content": bloques, "stop_reason": self.stop_reason})
+
+
+def usar_claude(monkeypatch, fake):
+    creados = {}
+
+    def constructor(**kwargs):
+        creados.update(kwargs)
+        return fake
+
+    monkeypatch.setattr("anthropic.Anthropic", constructor)
+    return creados
+
+
+def test_claude_devuelve_solo_texto(monkeypatch):
+    fake = FakeAnthropic([{"type": "thinking", "thinking": ""}, {"type": "text", "text": " Hola Ana. "}])
+    creados = usar_claude(monkeypatch, fake)
+    assert core.generar_feedback("sk-ant-x", core.CLAUDE, "claude-haiku-5-5", "p") == "Hola Ana."
+    assert creados["api_key"] == "sk-ant-x"
+    assert fake.kwargs["model"] == "claude-haiku-5-5"
+    assert fake.kwargs["output_config"] == {"effort": "low"}
+    assert "temperature" not in fake.kwargs
+
+
+def test_claude_rechazo(monkeypatch):
+    usar_claude(monkeypatch, FakeAnthropic([], stop_reason="refusal"))
+    with pytest.raises(RuntimeError, match="rechazo"):
+        core.generar_feedback("k", core.CLAUDE, "claude-haiku-5-5", "p")
+
+
+def test_claude_clave_invalida(monkeypatch):
+    import anthropic
+    import httpx2 as httpx
+
+    resp = httpx.Response(401, request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
+    error = anthropic.AuthenticationError("invalid x-api-key", response=resp, body=None)
+    usar_claude(monkeypatch, FakeAnthropic([], error=error))
+    with pytest.raises(RuntimeError, match="no es válida"):
+        core.generar_feedback("k", core.CLAUDE, "claude-haiku-5-5", "p")
+
+
+def test_claude_en_lista_de_proveedores():
+    conf = core.PROVEEDORES[core.CLAUDE]
+    assert conf["modelos"] == ["claude-haiku-5-5"] and conf["env_key"] == "ANTHROPIC_API_KEY"

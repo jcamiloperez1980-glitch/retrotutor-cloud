@@ -26,7 +26,14 @@ TODAS_EXT = EXT_DOCUMENTO + EXT_IMAGEN
 
 # ── Proveedores y modelos LLM ────────────────────────────────────────────────
 
+CLAUDE = "Claude (Anthropic)"
+
 PROVEEDORES = {
+    CLAUDE: {
+        "base_url": None,
+        "env_key": "ANTHROPIC_API_KEY",
+        "modelos": ["claude-haiku-5-5"],
+    },
     "OpenRouter": {
         "base_url": "https://openrouter.ai/api/v1",
         "env_key": "OPENROUTER_API_KEY",
@@ -209,8 +216,44 @@ def construir_prompt(
     )
 
 
+def _feedback_claude(api_key: str, modelo_llm: str, prompt: str) -> str:
+    """Genera la retroalimentación con la API de Claude (SDK oficial de Anthropic)."""
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=api_key)
+    try:
+        resp = client.messages.create(
+            model=modelo_llm,
+            # Incluye el razonamiento interno del modelo; la respuesta final es corta.
+            max_tokens=4000,
+            # Texto breve: esfuerzo bajo = más rápido y barato.
+            output_config={"effort": "low"},
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except anthropic.AuthenticationError as exc:
+        raise RuntimeError("La API Key de Anthropic no es válida.") from exc
+    except anthropic.PermissionDeniedError as exc:
+        raise RuntimeError("La API Key de Anthropic no tiene permiso para este modelo.") from exc
+    except anthropic.RateLimitError as exc:
+        raise RuntimeError("Se alcanzó el límite de uso de Anthropic. Espera un momento e intenta de nuevo.") from exc
+    except anthropic.APIStatusError as exc:
+        raise RuntimeError(f"Error de Anthropic ({exc.status_code}): {exc.message}") from exc
+    except anthropic.APIConnectionError as exc:
+        raise RuntimeError("No hubo conexión con Anthropic. Revisa tu internet e intenta de nuevo.") from exc
+
+    if resp.stop_reason == "refusal":
+        raise RuntimeError("Claude no generó esta retroalimentación (rechazo de seguridad). Revisa el contenido.")
+    texto = "".join(b.text for b in resp.content if b.type == "text").strip()
+    if not texto:
+        raise RuntimeError("El modelo devolvió una respuesta vacía. Intenta de nuevo.")
+    return texto
+
+
 def generar_feedback(api_key: str, proveedor: str, modelo_llm: str, prompt: str) -> str:
-    """Llama al proveedor (API compatible con OpenAI) y devuelve el texto generado."""
+    """Llama al proveedor elegido y devuelve el texto generado."""
+    if proveedor == CLAUDE:
+        return _feedback_claude(api_key, modelo_llm, prompt)
+
     from openai import OpenAI
 
     base_url = PROVEEDORES[proveedor]["base_url"]

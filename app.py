@@ -189,8 +189,16 @@ with st.sidebar:
         st.success(f"Licencia activa ({days_left} días restantes)")
 
     st.subheader("Retroalimentación IA")
-    proveedor = st.selectbox("Proveedor", list(core.PROVEEDORES))
+    nombres_prov = list(core.PROVEEDORES)
+    # Por defecto, el primer proveedor que ya tenga clave en el servidor.
+    con_clave = [i for i, p in enumerate(nombres_prov) if leer_secreto(core.PROVEEDORES[p]["env_key"])]
+    proveedor = st.selectbox("Proveedor", nombres_prov, index=con_clave[0] if con_clave else 0)
     conf = core.PROVEEDORES[proveedor]
+    ayuda_clave = {
+        core.CLAUDE: "Créala en console.anthropic.com",
+        "OpenRouter": "Obtén una gratis en openrouter.ai",
+        "OpenAI": "platform.openai.com",
+    }
     clave_servidor = leer_secreto(conf["env_key"])
     if clave_servidor:
         st.caption("✅ Este servidor ya tiene una API Key configurada.")
@@ -201,11 +209,11 @@ with st.sidebar:
     else:
         api_key = st.text_input(
             f"API Key {proveedor}", type="password", key=f"key_{proveedor}",
-            help="Obtén una gratis en openrouter.ai" if proveedor == "OpenRouter" else "platform.openai.com",
+            help=ayuda_clave.get(proveedor),
         )
     modelo_llm = st.selectbox(
         "Modelo LLM", conf["modelos"],
-        help="Los modelos :free no tienen costo en OpenRouter (con límites de uso)",
+        help="Los modelos :free no tienen costo en OpenRouter (con límites de uso)" if proveedor == "OpenRouter" else None,
     )
 
 

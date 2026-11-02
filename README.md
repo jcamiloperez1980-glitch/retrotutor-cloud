@@ -38,7 +38,7 @@ El veredicto sigue siendo del instructor. La IA no califica: redacta.
 | Qué | Para qué | ¿Obligatorio? |
 |---|---|---|
 | Python 3.11 o superior | Ejecutar la app | Sí |
-| Proveedor de IA: [OpenRouter](https://openrouter.ai) (tiene modelos gratuitos) u [OpenAI](https://platform.openai.com) | Redactar la retroalimentación | Sí, con la clave del instructor o una del servidor |
+| Proveedor de IA: **Claude** de [Anthropic](https://console.anthropic.com) (modelo `claude-haiku-5-5`), [OpenRouter](https://openrouter.ai) (tiene modelos gratuitos) u [OpenAI](https://platform.openai.com) | Redactar la retroalimentación | Sí, con la clave del instructor o una del servidor |
 | `ZP_SECRET` | Validar códigos Pro (el mismo secreto de Zajuna Panel) | Solo para activar Pro. Sin él, la prueba gratuita funciona y la activación Pro queda deshabilitada |
 | Tesseract OCR (`tesseract-ocr`, `tesseract-ocr-spa`) | Leer texto de imágenes | Opcional: sin él, las imágenes se aceptan pero sin texto extraído |
 | Base de datos | — | No usa |
@@ -50,7 +50,8 @@ Se leen de variables de entorno o de `.streamlit/secrets.toml` (ver [`.streamlit
 | Variable | Descripción |
 |---|---|
 | `ZP_SECRET` | Secreto HMAC para validar los códigos Pro |
-| `OPENROUTER_API_KEY` | *(Opcional)* Clave del servidor para OpenRouter. Si existe, el instructor no tiene que pegar la suya |
+| `ANTHROPIC_API_KEY` | *(Opcional)* Clave del servidor para Claude. Si existe, el instructor no tiene que pegar la suya y Claude queda como proveedor por defecto |
+| `OPENROUTER_API_KEY` | *(Opcional)* Igual, para OpenRouter |
 | `OPENAI_API_KEY` | *(Opcional)* Igual, para OpenAI |
 
 Si no hay clave del servidor, cada instructor pega la suya en la barra lateral. Esa clave se usa solo durante la sesión y no se guarda.
@@ -124,6 +125,7 @@ docs/capturas/         Capturas de pantalla
 - **Sin persistencia**: lo que no se descarga se pierde al cerrar la pestaña.
 - **Las imágenes no se analizan visualmente**: solo se usa el texto del OCR y las notas del instructor.
 - **La prueba gratuita depende de una cookie**: si se borran las cookies o se usa otro navegador, empieza de nuevo.
+- **Claude (`claude-haiku-5-5`) no tiene plan gratuito**: cobra por uso a la cuenta de Anthropic dueña de la clave. Es el modelo más económico de Claude y la app lo usa con esfuerzo bajo, porque los textos son cortos.
 - **Los modelos `:free` de OpenRouter** tienen límites de uso y su catálogo cambia. Si uno deja de existir, la app muestra el error en la entrega y hay que elegir otro.
 
 ## Autor
