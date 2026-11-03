@@ -57,4 +57,4 @@ RetroTutor es una aplicación web. El instructor sube la guía de aprendizaje, l
 ## Contacto
 
 **Juan Camilo Pérez**, Research AI Lab. Docente e instructor (UNAD, SENA).
-Correo: **[CORREO DE CONTACTO]** · WhatsApp: **[NÚMERO]** · Demo en línea: **[ENLACE A LA APP]**
+Correo: **jcamilope@researchailab.com** · WhatsApp: **+57 311 612 8640 (https://wa.me/573116128640)** · Demo en línea: **[ENLACE A LA APP]**
