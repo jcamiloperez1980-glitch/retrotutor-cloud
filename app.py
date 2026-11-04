@@ -1,278 +1,121 @@
 """
 RetroTutor Cloud — Retroalimentación automática de evidencias estudiantiles.
 Versión desplegable en Streamlit Cloud. Soporta documentos, texto e imágenes.
+
+La lógica (licencias, extracción, prompt, LLM, exportaciones) vive en core.py.
 """
 
-import hashlib
-import hmac
-import io
-import math
 import os
-import tempfile
 import time
-import zipfile
-from datetime import date, datetime, timedelta, timezone
+import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import extra_streamlit_components as stx
-import pandas as pd
 import streamlit as st
-from openai import OpenAI
+from extra_streamlit_components.CookieManager import _component_func as _cookie_component
 
-# ── Configuración ─────────────────────────────────────────────────────────────
+import core
 
 st.set_page_config(page_title="RetroTutor", page_icon="🎓", layout="wide")
 
-EXT_DOCUMENTO = ["pdf", "docx", "pptx", "txt", "md"]
-EXT_IMAGEN = ["png", "jpg", "jpeg", "gif", "webp", "bmp"]
-TODAS_EXT = EXT_DOCUMENTO + EXT_IMAGEN
 
-PROMPT = """You are a university tutor. Write SHORT personalized feedback (MAX 150 words, this is critical — never exceed it).
+# ── Configuración y secretos ─────────────────────────────────────────────────
 
-Student: {nombre}
-{bloque_guia}
-{bloque_rubrica}
-VERDICT: {veredicto_texto}
-{bloque_contenido}
-{bloque_observaciones}
+def leer_secreto(nombre: str) -> str:
+    """Lee un secreto de variables de entorno o de .streamlit/secrets.toml.
 
-Structure (no headers, no bullets, plain text only):
-- Greet by first name
-- ONE paragraph: what they did well/poorly, be specific about their content
-- TWO concrete suggestions (most impactful)
-- Brief encouraging closing
-
-STRICT LIMIT: 150 words maximum. Be concise."""
-
-VEREDICTO_APROBADO = (
-    "APPROVED — the student met the requirements. Focus on strengths, "
-    "celebrate what they did well, and offer minor suggestions for excellence."
-)
-VEREDICTO_DEFICIENTE = (
-    "NEEDS IMPROVEMENT — the student did not meet the requirements. "
-    "Be constructive: clearly state what fell short, give specific actionable "
-    "steps to improve, and maintain an encouraging tone. Motivate them to try again."
-)
-
-# ── Licencia (compatible con Zajuna Panel) ───────────────────────────────────
-
-ZP_SECRET = st.secrets["ZP_SECRET"]
-ZP_EPOCH = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    Nunca falla: si no existe, devuelve "".
+    """
+    valor = os.environ.get(nombre, "")
+    if valor:
+        return valor
+    try:
+        return str(st.secrets.get(nombre, "") or "")
+    except Exception:  # no hay secrets.toml
+        return ""
 
 
-def zp_sign(payload: str) -> str:
-    sig = hmac.new(ZP_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
-    return sig[:6].upper()
+ZP_SECRET = leer_secreto("ZP_SECRET")
+COOKIE_DIAS = 400
 
 
-def zp_validate(code: str) -> dict:
-    code = (code or "").strip().upper()
-    import re
-    m = re.match(r"^ZP-([0-9A-Z]{3})-([0-9A-Z]{4})-([0-9A-Z]{6})$", code)
-    if not m:
-        return {"valid": False, "reason": "Formato inválido. Ejemplo: ZP-XXX-XXXX-XXXXXX"}
-    exp, rand, sig = m.group(1), m.group(2), m.group(3)
-    expected = zp_sign(f"{exp}-{rand}")
-    if sig != expected:
-        return {"valid": False, "reason": "Código no válido."}
-    days = int(exp, 36)
-    expires = ZP_EPOCH.timestamp() + days * 86400
-    expires_dt = datetime.fromtimestamp(expires, tz=timezone.utc)
-    days_left = (expires_dt.date() - datetime.now(timezone.utc).date()).days
-    if days_left <= 0:
-        return {"valid": False, "reason": f"Este código venció el {expires_dt.strftime('%d/%m/%Y')}."}
-    return {"valid": True, "expires": expires_dt, "days_left": days_left}
+class CookiesNavegador(stx.CookieManager):
+    """CookieManager que distingue «aún no cargó» (None) de «no hay cookies» ({}).
 
+    El CookieManager original devuelve {} en la primera ejecución, antes de que
+    el navegador responda; eso hacía que la prueba gratuita se reiniciara en
+    cada visita porque la cookie existente se sobrescribía.
+    """
 
-# ── Prueba gratuita de 14 días (compatible con Zajuna Panel) ───────────────────
-# RetroTutor cloud es una sola app compartida (no tiene storage local por
-# instalación como la extensión), así que el inicio de la prueba se guarda en
-# una cookie del navegador (400 días, la misma persona la conserva de sesión en
-# sesión) — mismo espíritu que la extensión: validación offline, sin backend.
+    def __init__(self):  # noqa: D401 — no llamamos al __init__ original
+        self.cookie_manager = _cookie_component
+        self.cookies = _cookie_component(method="getAll", key="init", default=None)
 
-ZP_TRIAL_DAYS = 14
-
-
-def zp_trial_status(cookie_manager: stx.CookieManager) -> dict:
-    cookies = cookie_manager.get_all()
-    raw = cookies.get("zpTrialStart")
-    if raw is None:
-        start_ms = int(time.time() * 1000)
-        cookie_manager.set("zpTrialStart", start_ms, max_age=400 * 86400)
-    else:
-        try:
-            start_ms = int(raw)
-        except (TypeError, ValueError):
-            start_ms = int(time.time() * 1000)
-    start = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
-    ends_at = start + timedelta(days=ZP_TRIAL_DAYS)
-    days_left = max(0, math.ceil((ends_at - datetime.now(timezone.utc)).total_seconds() / 86400))
-    return {"active": days_left > 0, "days_left": days_left, "ends_at": ends_at}
-
+    def guardar(self, nombre: str, valor, key: str):
+        self.set(
+            nombre, valor, key=key,
+            expires_at=datetime.now() + timedelta(days=COOKIE_DIAS),
+            max_age=COOKIE_DIAS * 86400,
+        )
 
 
 # ── Estado ────────────────────────────────────────────────────────────────────
 
-if "espacios" not in st.session_state:
-    st.session_state.espacios = []
-if "espacio_idx" not in st.session_state:
-    st.session_state.espacio_idx = None
-if "licencia_ok" not in st.session_state:
-    st.session_state.licencia_ok = False
-if "licencia_trial" not in st.session_state:
-    st.session_state.licencia_trial = False
+for _k, _v in {
+    "espacios": [], "espacio_idx": None, "licencia_ok": False,
+    "licencia_trial": False, "licencia_days": 0,
+}.items():
+    st.session_state.setdefault(_k, _v)
 
-_cookie_manager = stx.CookieManager()
+cookies = CookiesNavegador()
+if cookies.cookies is None:
+    # El componente de cookies todavía no respondió; Streamlit vuelve a
+    # ejecutar el script automáticamente cuando llega la respuesta.
+    st.caption("Cargando RetroTutor…")
+    st.stop()
+
+
+def activar_pro(codigo: str) -> bool:
+    resultado = core.zp_validate(codigo, ZP_SECRET)
+    if not resultado["valid"]:
+        st.error(resultado["reason"])
+        return False
+    codigo = codigo.strip().upper()
+    st.session_state.licencia_ok = True
+    st.session_state.licencia_trial = False
+    st.session_state.licencia_days = resultado["days_left"]
+    # Recordar el código en este navegador para no pedirlo en cada visita.
+    cookies.guardar("zpProCode", codigo, key="set_pro")
+    return True
+
 
 if not st.session_state.licencia_ok:
-    _trial = zp_trial_status(_cookie_manager)
-    if _trial["active"]:
+    # 1) Código Pro recordado en este navegador
+    codigo_guardado = cookies.cookies.get("zpProCode")
+    resultado = core.zp_validate(codigo_guardado, ZP_SECRET) if codigo_guardado else {"valid": False}
+    if resultado["valid"]:
         st.session_state.licencia_ok = True
-        st.session_state.licencia_trial = True
-        st.session_state.licencia_days = _trial["days_left"]
+        st.session_state.licencia_days = resultado["days_left"]
     else:
-        st.session_state.licencia_trial_expired = True
-
-
-# ── Funciones ─────────────────────────────────────────────────────────────────
-
-def ocr_imagen(datos: bytes) -> str:
-    try:
-        import pytesseract
-        from PIL import Image
-        img = Image.open(io.BytesIO(datos))
-        texto = pytesseract.image_to_string(img, lang="eng+spa")
-        return texto.strip()
-    except Exception:
-        return ""
-
-
-def extraer_texto(datos: bytes, nombre: str) -> str:
-    ext = Path(nombre).suffix.lower()
-    if ext in (".txt", ".md"):
-        return datos.decode("utf-8", errors="ignore")
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-        tmp.write(datos)
-        ruta = tmp.name
-    try:
-        if ext == ".pdf":
-            from pypdf import PdfReader
-            return "\n".join(p.extract_text() or "" for p in PdfReader(ruta).pages)
-        if ext == ".docx":
-            from docx import Document
-            return "\n".join(p.text for p in Document(ruta).paragraphs)
-        if ext == ".pptx":
-            from pptx import Presentation
-            textos = []
-            for slide in Presentation(ruta).slides:
-                for shape in slide.shapes:
-                    if shape.has_text_frame:
-                        textos.append(shape.text_frame.text)
-            return "\n".join(textos)
-    finally:
-        os.unlink(ruta)
-    return datos.decode("utf-8", errors="ignore")
-
-
-def clasificar_archivo(nombre: str) -> str:
-    ext = Path(nombre).suffix.lower().lstrip(".")
-    if ext in EXT_IMAGEN:
-        return "imagen"
-    return "documento"
-
-
-def generar_feedback(
-    api_key: str, proveedor: str, modelo_llm: str,
-    nombre: str, guia: str, rubrica: str,
-    contenido: str, tipo: str, veredicto: str,
-    observaciones: str = "", pct_dudosas: float = 0.0,
-) -> str:
-    if proveedor == "OpenRouter":
-        client = OpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1")
-    else:
-        client = OpenAI(api_key=api_key)
-
-    bloque_guia = f"ACTIVITY GUIDE:\n---\n{guia}\n---" if guia.strip() else ""
-    bloque_rubrica = f"EVALUATION RUBRIC:\n---\n{rubrica}\n---" if rubrica.strip() else ""
-    veredicto_texto = VEREDICTO_APROBADO if veredicto == "Aprobado" else VEREDICTO_DEFICIENTE
-
-    if tipo == "imagen":
-        bloque_contenido = (
-            f"STUDENT'S SUBMISSION (image):\n"
-            f"---\n{contenido}\n---"
-        )
-    else:
-        bloque_contenido = f"STUDENT'S SUBMISSION (text/document):\n---\n{contenido}\n---"
-
-    bloque_obs = f"INSTRUCTOR'S ADDITIONAL NOTES:\n{observaciones}" if observaciones.strip() else ""
-
-    prompt = PROMPT.format(
-        nombre=nombre or "Student",
-        bloque_guia=bloque_guia,
-        bloque_rubrica=bloque_rubrica,
-        veredicto_texto=veredicto_texto,
-        bloque_contenido=bloque_contenido,
-        bloque_observaciones=bloque_obs,
-    )
-    resp = client.chat.completions.create(
-        model=modelo_llm,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.4,
-        max_tokens=1500,
-    )
-    return resp.choices[0].message.content
-
-
-def _nombre_seguro(texto: str) -> str:
-    import re
-    limpio = re.sub(r"[^\w\s.-]", "", texto).strip()
-    return re.sub(r"\s+", "_", limpio)[:80] or "entrega"
-
-
-def zip_entregas(entregas: list[dict], nombre_espacio: str) -> bytes:
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as z:
-        usados: set[str] = set()
-        for e in entregas:
-            if not e.get("retroalimentacion"):
-                continue
-            base = _nombre_seguro(e["estudiante"]) or "estudiante"
-            nombre = base
-            c = 1
-            while nombre in usados:
-                nombre = f"{base}_{c}"
-                c += 1
-            usados.add(nombre)
-            contenido = (
-                f"Estudiante: {e['estudiante']}\n"
-                f"Archivo: {e['archivo_nombre']}\n"
-                f"Veredicto: {e['veredicto']}\n\n"
-                f"Retroalimentación:\n{e['retroalimentacion']}\n"
-            )
-            z.writestr(f"{nombre}.txt", contenido)
-    return buffer.getvalue()
-
-
-def excel_entregas(entregas: list[dict], nombre_espacio: str) -> bytes:
-    filas = []
-    for e in entregas:
-        filas.append({
-            "Estudiante": e["estudiante"],
-            "Archivo": e["archivo_nombre"],
-            "Tipo": e["tipo"],
-            "Veredicto": e.get("veredicto", ""),
-            "Retroalimentación": e.get("retroalimentacion", ""),
-            "Observaciones": e.get("observaciones", ""),
-        })
-    buf = io.BytesIO()
-    pd.DataFrame(filas).to_excel(buf, index=False, engine="openpyxl")
-    return buf.getvalue()
+        # 2) Prueba gratuita de 14 días (inicio guardado en cookie)
+        inicio = core.parse_trial_cookie(cookies.cookies.get("zpTrialStart"))
+        if inicio is None:
+            inicio = int(time.time() * 1000)
+            cookies.guardar("zpTrialStart", inicio, key="set_trial")
+        trial = core.trial_status(inicio)
+        if trial["active"]:
+            st.session_state.licencia_ok = True
+            st.session_state.licencia_trial = True
+            st.session_state.licencia_days = trial["days_left"]
+        else:
+            st.session_state.licencia_trial_expired = True
 
 
 # ── Gate de licencia ─────────────────────────────────────────────────────────
 
-def mostrar_gate():
+def mostrar_gate() -> bool:
+    """Muestra la pantalla de activación. Devuelve True si se activó en esta ejecución."""
     st.title("🎓 RetroTutor")
     st.markdown(
         "Retroalimentación automática con IA para evidencias estudiantiles. "
@@ -283,6 +126,7 @@ def mostrar_gate():
     st.divider()
 
     col1, col2 = st.columns([2, 1])
+    activado = False
     with col1:
         st.subheader("Activa tu acceso")
         st.markdown(
@@ -294,17 +138,12 @@ def mostrar_gate():
             help="Formato: ZP seguido de tres grupos separados por guiones",
         )
         if st.button("Activar", type="primary", disabled=not code):
-            result = zp_validate(code)
-            if result["valid"]:
-                st.session_state.licencia_ok = True
-                st.session_state.licencia_code = code
-                st.session_state.licencia_days = result["days_left"]
-                st.rerun()
-            else:
-                st.error(result["reason"])
+            activado = activar_pro(code)
+            if activado:
+                st.success("¡Licencia activada!")
 
     with col2:
-        st.subheader("No tienes código?")
+        st.subheader("¿No tienes código?")
         st.markdown(
             "Adquiere **Zajuna Panel Pro** y obtén acceso a:\n"
             "- Dashboard de calificaciones\n"
@@ -313,11 +152,13 @@ def mostrar_gate():
             "- Exportación CSV\n\n"
             "Desde **$10.000 COP/mes**"
         )
+    return activado
 
 
 if not st.session_state.licencia_ok:
-    mostrar_gate()
-    st.stop()
+    if not mostrar_gate():
+        st.stop()
+    st.divider()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -329,8 +170,8 @@ if not st.session_state.licencia_ok:
 with st.sidebar:
     st.header("⚙️ Configuración")
 
-    days_left = st.session_state.get("licencia_days", 0)
-    if st.session_state.get("licencia_trial"):
+    days_left = st.session_state.licencia_days
+    if st.session_state.licencia_trial:
         if days_left <= 3:
             st.warning(f"🎟️ Prueba gratuita: te quedan {days_left} día(s).")
         else:
@@ -340,36 +181,67 @@ with st.sidebar:
                 "Código de licencia", placeholder="ZP-XXX-XXXX-XXXXXX", key="trial_upgrade_code",
             )
             if st.button("Activar", key="trial_upgrade_btn", disabled=not trial_code):
-                result = zp_validate(trial_code)
-                if result["valid"]:
-                    st.session_state.licencia_trial = False
-                    st.session_state.licencia_code = trial_code
-                    st.session_state.licencia_days = result["days_left"]
-                    st.rerun()
-                else:
-                    st.error(result["reason"])
+                if activar_pro(trial_code):
+                    st.success("¡Licencia Pro activada!")
     elif days_left <= 7:
         st.warning(f"Tu licencia vence en {days_left} día(s).")
     else:
         st.success(f"Licencia activa ({days_left} días restantes)")
 
     st.subheader("Retroalimentación IA")
-    proveedor = st.selectbox("Proveedor", ["OpenRouter", "OpenAI"])
-    api_key = st.text_input(
-        "API Key OpenRouter" if proveedor == "OpenRouter" else "API Key OpenAI",
-        type="password",
-        help="Obtén una gratis en openrouter.ai" if proveedor == "OpenRouter" else "platform.openai.com",
-    )
-    MODELOS = {
-        "OpenRouter": [
-            "nvidia/nemotron-3-super-120b-a12b:free",
-            "deepseek/deepseek-r1-0528:free",
-            "google/gemma-3-27b-it:free",
-            "meta-llama/llama-4-maverick:free",
-        ],
-        "OpenAI": ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"],
+    nombres_prov = list(core.PROVEEDORES)
+    # Por defecto, el primer proveedor que ya tenga clave en el servidor.
+    con_clave = [i for i, p in enumerate(nombres_prov) if leer_secreto(core.PROVEEDORES[p]["env_key"])]
+    proveedor = st.selectbox("Proveedor", nombres_prov, index=con_clave[0] if con_clave else 0)
+    conf = core.PROVEEDORES[proveedor]
+    ayuda_clave = {
+        core.CLAUDE: "Créala en console.anthropic.com",
+        "OpenRouter": "Obtén una gratis en openrouter.ai",
+        "OpenAI": "platform.openai.com",
     }
-    modelo_llm = st.selectbox("Modelo LLM", MODELOS[proveedor], help="Los modelos :free no tienen costo en OpenRouter")
+    clave_servidor = leer_secreto(conf["env_key"])
+    if clave_servidor:
+        st.caption("✅ Este servidor ya tiene una API Key configurada.")
+        clave_usuario = st.text_input(
+            "Usar mi propia API Key (opcional)", type="password", key=f"key_{proveedor}",
+        )
+        api_key = clave_usuario or clave_servidor
+    else:
+        api_key = st.text_input(
+            f"API Key {proveedor}", type="password", key=f"key_{proveedor}",
+            help=ayuda_clave.get(proveedor),
+        )
+    modelo_llm = st.selectbox(
+        "Modelo LLM", conf["modelos"],
+        help="Los modelos :free no tienen costo en OpenRouter (con límites de uso)" if proveedor == "OpenRouter" else None,
+    )
+
+
+def generar_para(entrega: dict, espacio: dict) -> bool:
+    """Genera la retroalimentación de una entrega. Devuelve False si falló."""
+    prompt = core.construir_prompt(
+        entrega["estudiante"], espacio["guia"], espacio["rubrica"],
+        core.contenido_para_llm(entrega), entrega["tipo"], entrega["veredicto"],
+        entrega.get("observaciones", ""),
+    )
+    try:
+        entrega["retroalimentacion"] = core.generar_feedback(api_key, proveedor, modelo_llm, prompt)
+        entrega.pop("error", None)
+        # Descartar el texto editado anterior para que se muestre el nuevo.
+        st.session_state.pop(f"retro_{entrega['id']}", None)
+        return True
+    except Exception as exc:  # errores de red, clave inválida, límite de uso…
+        entrega["error"] = f"No se pudo generar: {exc}"
+        return False
+
+
+def nueva_entrega(**campos) -> dict:
+    base = {
+        "id": uuid.uuid4().hex, "veredicto": None, "retroalimentacion": None,
+        "observaciones": "", "imagen_bytes": None, "archivo_bytes": None, "archivo_mime": None,
+    }
+    base.update(campos)
+    return base
 
 
 # ── Navegación ───────────────────────────────────────────────────────────────
@@ -383,8 +255,11 @@ if idx is None:
         "**Retroalimentación automática para cualquier evidencia estudiantil:** "
         "documentos, texto, imágenes e infografías."
     )
+    st.caption(
+        "Los datos viven solo en esta sesión del navegador: al cerrar la pestaña se pierden. "
+        "Descarga el .zip o el .xlsx antes de salir."
+    )
 
-    # Crear espacio
     with st.expander(
         "➕ Crear espacio de retroalimentación",
         expanded=len(st.session_state.espacios) == 0,
@@ -396,11 +271,9 @@ if idx is None:
         tab_file, tab_text = st.tabs(["📎 Subir archivos", "✏️ Escribir texto"])
 
         with tab_file:
-            guia_file = st.file_uploader(
-                "Guía de la actividad", type=EXT_DOCUMENTO, key="guia_f_crear",
-            )
+            guia_file = st.file_uploader("Guía de la actividad", type=core.EXT_DOCUMENTO, key="guia_f_crear")
             rubrica_file = st.file_uploader(
-                "Rúbrica de evaluación (opcional)", type=EXT_DOCUMENTO, key="rub_f_crear",
+                "Rúbrica de evaluación (opcional)", type=core.EXT_DOCUMENTO, key="rub_f_crear",
             )
         with tab_text:
             guia_txt = st.text_area(
@@ -412,31 +285,22 @@ if idx is None:
                 placeholder="Criterios de evaluación y niveles de desempeño…",
             )
 
-        if st.button(
-            "✅ Crear espacio", type="primary",
-            use_container_width=True, disabled=not nombre_ev,
-        ):
-            guia = ""
-            if guia_file:
-                guia = extraer_texto(guia_file.read(), guia_file.name)
-            elif guia_txt:
-                guia = guia_txt
-            rubrica = ""
-            if rubrica_file:
-                rubrica = extraer_texto(rubrica_file.read(), rubrica_file.name)
-            elif rubrica_txt:
-                rubrica = rubrica_txt
+        if st.button("✅ Crear espacio", type="primary", width="stretch", disabled=not nombre_ev):
+            try:
+                guia = core.extraer_texto(guia_file.getvalue(), guia_file.name) if guia_file else guia_txt
+                rubrica = (
+                    core.extraer_texto(rubrica_file.getvalue(), rubrica_file.name)
+                    if rubrica_file else rubrica_txt
+                )
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                st.session_state.espacios.append({
+                    "nombre": nombre_ev, "guia": guia or "", "rubrica": rubrica or "", "entregas": [],
+                })
+                st.session_state.espacio_idx = len(st.session_state.espacios) - 1
+                st.rerun()
 
-            st.session_state.espacios.append({
-                "nombre": nombre_ev,
-                "guia": guia,
-                "rubrica": rubrica,
-                "entregas": [],
-            })
-            st.session_state.espacio_idx = len(st.session_state.espacios) - 1
-            st.rerun()
-
-    # Lista de espacios existentes
     if st.session_state.espacios:
         st.divider()
         st.subheader("Tus espacios")
@@ -460,12 +324,9 @@ else:
         st.rerun()
 
     st.title(f"🎓 {espacio['nombre']}")
-
-    has_guia = bool(espacio["guia"].strip())
-    has_rubrica = bool(espacio["rubrica"].strip())
     st.caption(
-        f"Guía: {'✅' if has_guia else '❌'} · "
-        f"Rúbrica: {'✅' if has_rubrica else '—'} · "
+        f"Guía: {'✅' if espacio['guia'].strip() else '❌'} · "
+        f"Rúbrica: {'✅' if espacio['rubrica'].strip() else '—'} · "
         f"{len(espacio['entregas'])} entregas"
     )
 
@@ -478,65 +339,51 @@ else:
     with tab_archivos:
         archivos = st.file_uploader(
             "Subir entregas de estudiantes",
-            type=TODAS_EXT,
+            type=core.TODAS_EXT,
             accept_multiple_files=True,
             key=f"upload_{idx}",
-            help="PDF, DOCX, PPTX, TXT, imágenes con OCR (PNG, JPG). El nombre del archivo se usa como nombre del estudiante.",
+            help="PDF, DOCX, PPTX, TXT, imágenes con OCR (PNG, JPG). "
+                 "El nombre del archivo se usa como nombre del estudiante.",
         )
-        if archivos and st.button(
-            f"➕ Agregar {len(archivos)} entregas",
-            type="primary", key=f"agregar_{idx}",
-        ):
+        if archivos and st.button(f"➕ Agregar {len(archivos)} entregas", type="primary", key=f"agregar_{idx}"):
             barra = st.progress(0, text="Procesando entregas…")
+            fallidos = []
             for i, arch in enumerate(archivos):
                 barra.progress(i / len(archivos), text=f"Procesando {arch.name}…")
-                tipo = clasificar_archivo(arch.name)
-                raw = arch.read()
-                contenido = ""
-
-                if tipo == "documento":
-                    contenido = extraer_texto(raw, arch.name)
-                elif tipo == "imagen":
-                    with st.spinner(f"Extrayendo texto de {arch.name}…"):
-                        contenido = ocr_imagen(raw)
-
-                espacio["entregas"].append({
-                    "estudiante": Path(arch.name).stem.replace("_", " "),
-                    "tipo": tipo,
-                    "contenido": contenido,
-                    "archivo_nombre": arch.name,
-                    "veredicto": None,
-                    "retroalimentacion": None,
-                    "observaciones": "",
-                    "imagen_bytes": raw if tipo == "imagen" else None,
-                    "archivo_bytes": raw,
-                    "archivo_mime": arch.type or "application/octet-stream",
-                })
+                tipo = core.clasificar_archivo(arch.name)
+                raw = arch.getvalue()
+                try:
+                    contenido = core.ocr_imagen(raw) if tipo == "imagen" else core.extraer_texto(raw, arch.name)
+                except ValueError as exc:
+                    fallidos.append(str(exc))
+                    contenido = ""
+                espacio["entregas"].append(nueva_entrega(
+                    estudiante=Path(arch.name).stem.replace("_", " "),
+                    tipo=tipo, contenido=contenido, archivo_nombre=arch.name,
+                    imagen_bytes=raw if tipo == "imagen" else None,
+                    archivo_bytes=raw, archivo_mime=arch.type or "application/octet-stream",
+                ))
             barra.progress(1.0, text="✅ Entregas agregadas")
+            if fallidos:
+                st.session_state.avisos_carga = fallidos
             st.rerun()
+        for aviso in st.session_state.pop("avisos_carga", []):
+            st.warning(aviso + " Se agregó sin texto; puedes escribir observaciones manualmente.")
 
     with tab_texto_ev:
-        nombre_txt = st.text_input(
-            "Nombre del estudiante", key=f"nom_txt_{idx}",
-            placeholder="Ej: María García",
-        )
+        nombre_txt = st.text_input("Nombre del estudiante", key=f"nom_txt_{idx}", placeholder="Ej: María García")
         texto_pegado = st.text_area(
             "Pegar la entrega del estudiante", height=200, key=f"txt_{idx}",
             placeholder="Pega aquí el texto que el estudiante envió…",
         )
         if st.button("➕ Agregar entrega", key=f"add_txt_{idx}") and texto_pegado:
-            espacio["entregas"].append({
-                "estudiante": nombre_txt or "Estudiante",
-                "tipo": "texto",
-                "contenido": texto_pegado,
-                "archivo_nombre": "texto pegado",
-                "veredicto": None,
-                "retroalimentacion": None,
-                "observaciones": "",
-                "imagen_bytes": None,
-                "archivo_bytes": None,
-                "archivo_mime": None,
-            })
+            espacio["entregas"].append(nueva_entrega(
+                estudiante=nombre_txt or "Estudiante", tipo="texto",
+                contenido=texto_pegado, archivo_nombre="texto pegado",
+            ))
+            # Limpiar el formulario para la siguiente entrega
+            st.session_state.pop(f"nom_txt_{idx}", None)
+            st.session_state.pop(f"txt_{idx}", None)
             st.rerun()
 
     # ── Lista de entregas ────────────────────────────────────────────────
@@ -544,7 +391,6 @@ else:
         st.info("Aún no hay entregas. Sube archivos o pega texto.")
     else:
         st.divider()
-
         sin_veredicto = sum(1 for e in espacio["entregas"] if not e.get("veredicto"))
 
         st.subheader(f"Calificar entregas ({len(espacio['entregas'])})")
@@ -554,13 +400,11 @@ else:
             icon="👇",
         )
 
-        for i, ent in enumerate(espacio["entregas"]):
-            if ent.get("retroalimentacion"):
-                icono = "✅"
-            elif ent.get("veredicto"):
-                icono = "⏳"
-            else:
-                icono = "⬜"
+        tipo_label = {"documento": "📄 Documento", "texto": "📝 Texto", "imagen": "🖼️ Imagen"}
+
+        for ent in list(espacio["entregas"]):
+            uid = ent["id"]  # clave estable: no se corre al eliminar entregas
+            icono = "✅" if ent.get("retroalimentacion") else "⏳" if ent.get("veredicto") else "⬜"
 
             with st.expander(
                 f"{icono} {ent['estudiante']} — {ent['archivo_nombre']}",
@@ -569,22 +413,14 @@ else:
                 col_prev, col_ctrl = st.columns([3, 2])
 
                 with col_prev:
-                    tipo_label = {
-                        "documento": "📄 Documento",
-                        "texto": "📝 Texto",
-                        "imagen": "🖼️ Imagen",
-                    }
                     st.caption(tipo_label.get(ent["tipo"], ent["tipo"]))
-
                     if ent.get("archivo_bytes"):
                         st.download_button(
                             f"📥 Descargar {ent['archivo_nombre']}",
-                            data=ent["archivo_bytes"],
-                            file_name=ent["archivo_nombre"],
-                            mime=ent.get("archivo_mime", "application/octet-stream"),
-                            key=f"dl_{idx}_{i}",
+                            data=ent["archivo_bytes"], file_name=ent["archivo_nombre"],
+                            mime=ent.get("archivo_mime") or "application/octet-stream",
+                            key=f"dl_{uid}",
                         )
-
                     if ent["tipo"] == "imagen" and ent.get("imagen_bytes"):
                         st.image(ent["imagen_bytes"], width=400)
                         if ent.get("contenido"):
@@ -597,84 +433,61 @@ else:
                             st.write(ent["contenido"][:3000] or "*Sin contenido*")
 
                 with col_ctrl:
-                    ent["estudiante"] = st.text_input(
-                        "Nombre", value=ent["estudiante"], key=f"est_{idx}_{i}",
-                    )
+                    ent["estudiante"] = st.text_input("Nombre", value=ent["estudiante"], key=f"est_{uid}")
 
                     st.markdown("**Veredicto** *(requerido)*")
-                    veredicto = st.radio(
+                    ent["veredicto"] = st.radio(
                         "Veredicto", ["Aprobado", "Deficiente"],
-                        index=(
-                            0 if ent.get("veredicto") == "Aprobado"
-                            else 1 if ent.get("veredicto") == "Deficiente"
-                            else None
-                        ),
-                        key=f"ver_{idx}_{i}", horizontal=True,
-                        label_visibility="collapsed",
+                        index={"Aprobado": 0, "Deficiente": 1}.get(ent.get("veredicto")),
+                        key=f"ver_{uid}", horizontal=True, label_visibility="collapsed",
                     )
-                    ent["veredicto"] = veredicto
 
                     if ent["tipo"] == "imagen":
                         ent["observaciones"] = st.text_area(
-                            "Describe lo que ves en la imagen",
-                            value=ent.get("observaciones", ""),
-                            key=f"obs_{idx}_{i}", height=80,
+                            "Describe lo que ves en la imagen", value=ent.get("observaciones", ""),
+                            key=f"obs_{uid}", height=80,
                             placeholder="Ej: Buen diseño visual, falta citar fuentes…",
                         )
                     else:
                         ent["observaciones"] = st.text_area(
-                            "Observaciones del instructor (opcional)",
-                            value=ent.get("observaciones", ""),
-                            key=f"obs_{idx}_{i}", height=60,
-                            placeholder="Notas adicionales…",
+                            "Observaciones del instructor (opcional)", value=ent.get("observaciones", ""),
+                            key=f"obs_{uid}", height=68, placeholder="Notas adicionales…",
                         )
 
                     btn_label = "🔄 Regenerar" if ent.get("retroalimentacion") else "🚀 Generar retroalimentación"
                     if st.button(
-                        btn_label, key=f"gen1_{idx}_{i}",
-                        use_container_width=True,
+                        btn_label, key=f"gen1_{uid}", width="stretch",
                         disabled=not ent.get("veredicto"),
                         type="primary" if ent.get("veredicto") and not ent.get("retroalimentacion") else "secondary",
                     ):
                         if not api_key:
                             st.error("Ingresa tu API Key en la barra lateral.")
                         else:
-                            contenido_llm = ent["contenido"]
-                            if ent["tipo"] == "imagen":
-                                partes = []
-                                if ent.get("contenido"):
-                                    partes.append(f"[OCR text from image]: {ent['contenido']}")
-                                if ent.get("observaciones"):
-                                    partes.append(f"[Instructor notes]: {ent['observaciones']}")
-                                contenido_llm = "\n".join(partes) or "No description provided."
                             with st.spinner("Generando…"):
-                                ent["retroalimentacion"] = generar_feedback(
-                                    api_key, proveedor, modelo_llm,
-                                    ent["estudiante"], espacio["guia"],
-                                    espacio["rubrica"], contenido_llm,
-                                    ent["tipo"], ent["veredicto"],
-                                    ent.get("observaciones", ""),
-                                )
+                                generar_para(ent, espacio)
                             st.rerun()
 
                     if not ent.get("veredicto"):
                         st.caption("↑ Selecciona Aprobado o Deficiente para habilitar")
 
+                if ent.get("error"):
+                    st.error(ent["error"])
+
                 if ent.get("retroalimentacion"):
                     st.divider()
-                    st.markdown("**Retroalimentación generada:**")
-                    st.markdown(ent["retroalimentacion"])
+                    st.markdown("**Retroalimentación generada** (puedes editarla antes de exportar):")
+                    ent["retroalimentacion"] = st.text_area(
+                        "Retroalimentación", value=ent["retroalimentacion"], key=f"retro_{uid}",
+                        height=200, label_visibility="collapsed",
+                    )
 
-                if st.button("🗑️ Eliminar entrega", key=f"del_{idx}_{i}"):
-                    espacio["entregas"].pop(i)
+                if st.button("🗑️ Eliminar entrega", key=f"del_{uid}"):
+                    espacio["entregas"].remove(ent)
                     st.rerun()
 
         # ── Acciones en lote ─────────────────────────────────────────────
         st.divider()
-        pendientes = [
-            e for e in espacio["entregas"]
-            if e.get("veredicto") and not e.get("retroalimentacion")
-        ]
+        pendientes = [e for e in espacio["entregas"] if e.get("veredicto") and not e.get("retroalimentacion")]
         con_retro = [e for e in espacio["entregas"] if e.get("retroalimentacion")]
 
         if sin_veredicto > 0:
@@ -687,32 +500,14 @@ else:
         col_gen, col_zip, col_xls = st.columns(3)
 
         with col_gen:
-            btn_disabled = len(pendientes) == 0 or not api_key
             if st.button(
-                f"🚀 Generar {len(pendientes)} pendientes",
-                type="primary", use_container_width=True,
-                disabled=btn_disabled,
+                f"🚀 Generar {len(pendientes)} pendientes", type="primary", width="stretch",
+                disabled=not pendientes or not api_key,
             ):
                 barra = st.progress(0, text="Generando retroalimentaciones…")
                 for j, e in enumerate(pendientes):
-                    barra.progress(
-                        j / len(pendientes),
-                        text=f"Retroalimentando {e['estudiante']}…",
-                    )
-                    contenido_llm = e["contenido"]
-                    if e["tipo"] == "imagen":
-                        partes = []
-                        if e.get("contenido"):
-                            partes.append(f"[OCR text from image]: {e['contenido']}")
-                        if e.get("observaciones"):
-                            partes.append(f"[Instructor notes]: {e['observaciones']}")
-                        contenido_llm = "\n".join(partes) or "No description provided."
-                    e["retroalimentacion"] = generar_feedback(
-                        api_key, proveedor, modelo_llm,
-                        e["estudiante"], espacio["guia"], espacio["rubrica"],
-                        contenido_llm, e["tipo"], e["veredicto"],
-                        e.get("observaciones", ""),
-                    )
+                    barra.progress(j / len(pendientes), text=f"Retroalimentando {e['estudiante']}…")
+                    generar_para(e, espacio)
                 barra.progress(1.0, text="✅ Listo")
                 st.rerun()
 
@@ -720,22 +515,23 @@ else:
             if con_retro:
                 st.download_button(
                     f"📦 Descargar .zip ({len(con_retro)})",
-                    zip_entregas(con_retro, espacio["nombre"]),
-                    file_name=f"retro_{_nombre_seguro(espacio['nombre'])}.zip",
-                    mime="application/zip",
-                    use_container_width=True,
+                    core.zip_entregas(con_retro),
+                    file_name=f"retro_{core.nombre_seguro(espacio['nombre'])}.zip",
+                    mime="application/zip", width="stretch",
                 )
 
         with col_xls:
             if con_retro:
                 st.download_button(
                     f"📊 Descargar .xlsx ({len(con_retro)})",
-                    excel_entregas(espacio["entregas"], espacio["nombre"]),
-                    file_name=f"retro_{_nombre_seguro(espacio['nombre'])}.xlsx",
+                    core.excel_entregas(espacio["entregas"]),
+                    file_name=f"retro_{core.nombre_seguro(espacio['nombre'])}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
+                    width="stretch",
                 )
 
+        con_error = sum(1 for e in espacio["entregas"] if e.get("error"))
+        if con_error:
+            st.error(f"{con_error} entrega(s) fallaron al generar. Revisa la clave, el modelo o intenta de nuevo.")
         if not api_key and pendientes:
             st.warning("Ingresa tu API Key en la barra lateral para generar retroalimentaciones.")
-
