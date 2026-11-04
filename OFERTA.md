@@ -43,8 +43,8 @@ RetroTutor es una aplicación web. El instructor sube la guía de aprendizaje, l
 | Modalidad | Para quién | Incluye | Precio |
 |---|---|---|---|
 | Prueba gratuita | Cualquier instructor | 14 días de acceso completo, sin código ni tarjeta | Gratis |
-| Licencia individual Pro | Instructor o docente | Acceso a RetroTutor + Zajuna Panel Pro | **[PRECIO POR DEFINIR]** |
-| Licencia institucional | Centro de formación, regional o institución | Licencias para un grupo de instructores, acompañamiento en la adopción y opción de clave de IA incluida | **[PRECIO POR DEFINIR]** |
+| Licencia individual Pro | Instructor o docente | Acceso a RetroTutor + Zajuna Panel Pro | **$190.000 por docente al año** |
+| Licencia institucional | Centro de formación, regional o institución | Licencias para un grupo de instructores, acompañamiento en la adopción y opción de clave de IA incluida | **$3.500.000 al año, hasta 25 docentes** |
 | Piloto | Coordinación académica | Prueba guiada con un grupo de instructores y medición del tiempo ahorrado | **[PRECIO / CONDICIONES POR DEFINIR]** |
 
 ## Propuesta de piloto
